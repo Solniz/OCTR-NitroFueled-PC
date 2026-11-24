@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -12,9 +12,11 @@
 #include <coroutine>
 #include <exception>
 #include <mutex>
+#include <optional>
 #include <semaphore>
 #include <span>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <queue>
 
@@ -41,6 +43,23 @@ bool SubmitLockOnDecode(); // gnmdriver.cpp
 namespace AmdGpu {
 
 union PM4Header;
+struct PM4CmdSetPredication;
+struct PM4CmdCopyData;
+
+/// SET_PREDICATION state a predicated draw or dispatch carries to where it is recorded (the draw
+/// recording thread): the op, the predicate's address and how its value is read.
+struct DrawPredicate {
+    /// The values of PM4CmdSetPredication::PredOp.
+    enum class Op : u8 { None = 0, Zpass = 1, PrimCount = 2, Bool64 = 3, Bool32 = 4 };
+    Op op{Op::None};
+    bool inverted{};     ///< DRAW_OP 0: draw if not visible / overflowed / false
+    bool hint{};         ///< draw while the results are not final instead of waiting
+    bool continue_bit{}; ///< ANDed with the result of the predications before it
+    VAddr address{};
+    explicit operator bool() const noexcept {
+        return op != Op::None;
+    }
+};
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
@@ -202,6 +221,30 @@ public:
         return gpu_id;
     }
 
+    /// Decoder: the predicate of the packet being decoded (none unless the packet has the
+    /// predicate bit and SET_PREDICATION enabled one). The rasterizer takes it for the draw or
+    /// dispatch the packet hands over.
+    [[nodiscard]] DrawPredicate CurrentPredicate() const noexcept {
+        if (!predication.enabled || !predication.is_packet_predicated ||
+            predication.predicate.address == 0) {
+            return {};
+        }
+        return predication.predicate;
+    }
+
+    /// The result of the predications since the last SET_PREDICATION without CONTINUE (written
+    /// where draws are recorded; the decoder reads it after the draw pipe has run dry).
+    [[nodiscard]] bool GetPredicationAccumulatedResult() const noexcept {
+        return predication_result.load(std::memory_order_acquire);
+    }
+
+    void SetPredicationAccumulatedResult(bool result, bool continue_bit) noexcept {
+        if (continue_bit) {
+            result = result && predication_result.load(std::memory_order_acquire);
+        }
+        predication_result.store(result, std::memory_order_release);
+    }
+
 #if defined(__linux__) || defined(_WIN32)
     u32 GetGpuCommandProcessorThreadId() {
         return gpu_tid;
@@ -287,6 +330,25 @@ private:
     void ProcessCommands();
     void Process(std::stop_token stoken);
 
+    /// SET_PREDICATION (graphics and compute rings).
+    void ApplySetPredication(const PM4CmdSetPredication& set_pred, bool compute);
+    /// COPY_DATA between memory and immediates (graphics and compute rings).
+    void ExecuteCopyData(const PM4CmdCopyData& copy_data);
+    /// A 32-bit value the command processor reads from guest memory (COND_EXEC): fences queued
+    /// before it in stream order count as written. False when the address is not mapped.
+    bool ReadCommandValue(VAddr address, u32& value);
+    /// A predicated DRAW_INDEX_2 the GPU may skip leaves the index base it set: restored at the
+    /// next SET_PREDICATION.
+    void RestorePredicatedIndexBase();
+    std::optional<std::pair<u32, u32>> saved_index_base;
+
+    struct PredicationState {
+        bool enabled{false};
+        bool is_packet_predicated{false};
+        DrawPredicate predicate{};
+    } predication{};
+    std::atomic<bool> predication_result{true};
+
     struct GpuQueue {
         std::mutex m_access{};
         std::atomic<u32> dcb_buffer_offset;
@@ -302,6 +364,13 @@ private:
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};
     u64 pixel_counter{};
+    /// PIXEL_PIPE_STAT_CONTROL: the layout of ZPASS_DONE / PIXEL_PIPE_STAT_DUMP results.
+    struct PipeStatControl {
+        u32 stride{16};
+        u32 num_dbs{8};
+        u32 instance_mask{0xff};
+    } pipe_stat_control{};
+    u64 streamout_counter{1000ULL};
 
     struct ConstantEngine {
         void Reset() {
