@@ -635,10 +635,12 @@ s32 PS4_SYSV_ABI sceGnmDrawIndex(u32* cmdbuf, u32 size, u32 index_count, uintptr
     BbD3d11::OnDraw(true, index_count, index_addr);
 
     if (cmdbuf && (size == 10) && (index_addr != 0) && (index_addr & 1) == 0 &&
-        (flags & 0x1ffffffe) == 0) { // no predication will be set in the packet
+        (flags & 0x1ffffffe) == 0) {
+        // Bit 0 of the flags predicates the draw (SET_PREDICATION).
+        const auto predicate = flags & 1 ? PM4Predicate::PredEnable : PM4Predicate::PredDisable;
         auto* draw_index = reinterpret_cast<PM4CmdDrawIndex2*>(cmdbuf);
         draw_index->header =
-            PM4Type3Header{PM4ItOpcode::DrawIndex2, 4, PM4ShaderType::ShaderGraphics};
+            PM4Type3Header{PM4ItOpcode::DrawIndex2, 4, PM4ShaderType::ShaderGraphics, predicate};
         draw_index->max_size = index_count;
         draw_index->index_base_lo = u32(index_addr);
         draw_index->index_base_hi = u32(index_addr >> 32);
@@ -657,11 +659,12 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexAuto(u32* cmdbuf, u32 size, u32 index_count, u32
     BbNativeVk::OnDraw(false, index_count, 0);
     BbD3d11::OnDraw(false, index_count, 0);
 
-    if (cmdbuf && (size == 7) &&
-        (flags & 0x1ffffffe) == 0) { // no predication will be set in the packet
-        cmdbuf = WritePacket<PM4ItOpcode::DrawIndexAuto>(
-            cmdbuf, PM4ShaderType::ShaderGraphics, index_count,
-            sceKernelIsNeoMode() ? flags & 0xe0000000u | 2u : 2u);
+    if (cmdbuf && (size == 7) && (flags & 0x1ffffffe) == 0) {
+        const auto predicate = flags & 1 ? PM4Predicate::PredEnable : PM4Predicate::PredDisable;
+        cmdbuf = WriteHeader<PM4ItOpcode::DrawIndexAuto>(cmdbuf, 2, PM4ShaderType::ShaderGraphics,
+                                                         predicate);
+        cmdbuf =
+            WriteBody(cmdbuf, index_count, sceKernelIsNeoMode() ? flags & 0xe0000000u | 2u : 2u);
         WriteTrailingNop<3>(cmdbuf);
         return ORBIS_OK;
     }
@@ -1002,10 +1005,22 @@ u32 PS4_SYSV_ABI sceGnmDrawInitToDefaultContextState400(u32* cmdbuf, u32 size) {
     return CtxInitPacketSize;
 }
 
-int PS4_SYSV_ABI sceGnmDrawOpaqueAuto() {
+s32 PS4_SYSV_ABI sceGnmDrawOpaqueAuto(u32* cmdbuf, u32 size, u32 flags) {
     BbD3d11::OnDrawUnsupported("sceGnmDrawOpaqueAuto");
-    LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
-    return ORBIS_OK;
+    LOG_TRACE(Lib_GnmDriver, "called");
+
+    if (cmdbuf && (size == 7) && (flags & 0x1ffffffe) == 0) {
+        const auto predicate = flags & 1 ? PM4Predicate::PredEnable : PM4Predicate::PredDisable;
+        // DRAW_INDEX_AUTO with USE_OPAQUE: the vertex count comes from the streamout buffer
+        // filled size.
+        cmdbuf = WriteHeader<PM4ItOpcode::DrawIndexAuto>(cmdbuf, 2, PM4ShaderType::ShaderGraphics,
+                                                         predicate);
+        cmdbuf =
+            WriteBody(cmdbuf, 0x10u, sceKernelIsNeoMode() ? (flags & 0xe0000000u) | 0x42u : 0x42u);
+        WriteTrailingNop<3>(cmdbuf);
+        return ORBIS_OK;
+    }
+    return -1;
 }
 
 bool PS4_SYSV_ABI sceGnmDriverCaptureInProgress() {
