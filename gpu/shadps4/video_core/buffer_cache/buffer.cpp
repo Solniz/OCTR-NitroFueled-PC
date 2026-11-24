@@ -172,13 +172,18 @@ Buffer::Buffer(const Vulkan::Instance& instance, u64 size_bytes_, vk::DeviceMemo
     const vk::ExternalMemoryBufferCreateInfo external{
         .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT,
     };
+    vk::BufferUsageFlags chunk_usage =
+        vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
+        vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eUniformBuffer |
+        vk::BufferUsageFlagBits::eUniformTexelBuffer | vk::BufferUsageFlagBits::eStorageTexelBuffer;
+    // Predicates (SET_PREDICATION Bool32/Bool64) may live in guest memory used in place.
+    if (instance.IsConditionalRenderingSupported()) {
+        chunk_usage |= vk::BufferUsageFlagBits::eConditionalRenderingEXT;
+    }
     const vk::BufferCreateInfo buffer_ci = {
         .pNext = &external,
         .size = size_bytes,
-        .usage = vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
-                 vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eUniformBuffer |
-                 vk::BufferUsageFlagBits::eUniformTexelBuffer |
-                 vk::BufferUsageFlagBits::eStorageTexelBuffer,
+        .usage = chunk_usage,
         .sharingMode = vk::SharingMode::eExclusive,
     };
     const auto device = instance.GetDevice();
@@ -195,9 +200,13 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, mem_type{mem_type_},
       buffer{instance.GetDevice(), instance.GetAllocator()} {
 
+    vk::BufferUsageFlags usage = AllFlags;
+    if (instance.IsConditionalRenderingSupported()) {
+        usage |= vk::BufferUsageFlagBits::eConditionalRenderingEXT;
+    }
     vk::BufferCreateInfo buffer_ci = {
         .size = size_bytes,
-        .usage = AllFlags,
+        .usage = usage,
         .sharingMode = vk::SharingMode::eExclusive,
     };
     // bbport: arenas are also read by the readback queue (BufferCache::DownloadMemory).
