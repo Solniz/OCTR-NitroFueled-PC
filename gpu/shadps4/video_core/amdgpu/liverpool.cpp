@@ -10,6 +10,8 @@
 #endif
 #include <unistd.h>
 #include <array>
+#include <atomic>
+#include <bit>
 #include <time.h>
 #include "bbport_threads.h"
 #include "bbport_ce_stats.h"
@@ -41,6 +43,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 extern "C" int runtime_memory_vma_info(uintptr_t address, int* prot, int* type, uintptr_t* end);
+extern "C" void runtime_memory_read_backing(std::uintptr_t, void*, std::uint64_t);
 
 namespace AmdGpu {
 
@@ -92,6 +95,9 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
 
 Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
+    pipe_stat_control.num_dbs = num_counter_pairs;
+    pipe_stat_control.stride = 16;
+    pipe_stat_control.instance_mask = (1u << num_counter_pairs) - 1;
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
 
@@ -679,6 +685,30 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
         BbFreeCheck::NoteFenceWritten(reinterpret_cast<u64>(event_eos.Address()));
     }
 }
+/// ZPASS_DONE / PIXEL_PIPE_STAT_DUMP: the occlusion counters of every DB written at `address`,
+/// in order with the draws (their queries end there).
+struct OcclusionDumpTask {
+    VAddr address;
+    u32 num_dbs;
+    u32 stride;
+};
+void RunOcclusionDump(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    OcclusionDumpTask task;
+    std::memcpy(&task, data, sizeof(task));
+    rasterizer.OcclusionDump(task.address, task.num_dbs, task.stride);
+}
+
+/// SAMPLE_STREAMOUTSTATS[1-3] / SAMPLE_PIPELINESTAT: primitive counters of a stream.
+struct StreamoutDumpTask {
+    VAddr address;
+    u32 stream;
+    u32 pad;
+};
+void RunStreamoutDump(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    StreamoutDumpTask task;
+    std::memcpy(&task, data, sizeof(task));
+    rasterizer.StreamoutDump(task.address, task.stream);
+}
 } // namespace
 
 void Liverpool::NotePendingFences(const auto& event) {
@@ -736,6 +766,147 @@ bool Liverpool::PendingFenceValue(VAddr address, u32& value) {
         }
     }
     return false;
+}
+
+void Liverpool::RestorePredicatedIndexBase() {
+    if (!saved_index_base) {
+        return;
+    }
+    regs.index_base_address.base_addr_lo = saved_index_base->first;
+    regs.index_base_address.base_addr_hi = saved_index_base->second;
+    saved_index_base.reset();
+    pipe_dirty.MarkField(regs, regs.index_base_address);
+    // Outside ApplyGraphicsRegisterPacket: the draw-preparation workers cannot reproduce it, so
+    // their checksums must differ from here on (as for compute SH registers).
+    const u32 words[2] = {regs.index_base_address.base_addr_lo,
+                          regs.index_base_address.base_addr_hi};
+    gfx_reg_checksum = HashRegisterPacket(gfx_reg_checksum ^ 0x9D1CA7E09D1CA7E0ull, words, 2);
+}
+
+bool Liverpool::ReadCommandValue(VAddr address, u32& value) {
+    auto* memory = Core::Memory::Instance();
+    if (address == 0 || (address & 3) != 0 || !memory ||
+        memory->ClampRangeSize(address, sizeof(u32)) != sizeof(u32)) {
+        return false;
+    }
+    // A fence or WRITE_DATA before this packet in stream order and not written yet.
+    if (rasterizer && PendingFenceValue(address, value)) {
+        return true;
+    }
+    // GPU-written data may still be in VRAM only.
+    if (rasterizer) {
+        rasterizer->ReadMemory(address, sizeof(u32));
+    }
+    runtime_memory_read_backing(address, &value, sizeof(u32));
+    return true;
+}
+
+void Liverpool::ApplySetPredication(const PM4CmdSetPredication& set_pred, bool compute) {
+    using PredOp = PM4CmdSetPredication::PredOp;
+    const bool is_continue = set_pred.continue_bit.Value() == 1;
+    if (!is_continue) {
+        predication_result.store(true, std::memory_order_release);
+    }
+    LOG_TRACE(Render,
+              "{}IT_SET_PREDICATION pred_op = {}, draw_op = {}, hint = {}, continue = {}, "
+              "addr = {:#x}",
+              compute ? "compute " : "", magic_enum::enum_name(set_pred.pred_op.Value()),
+              set_pred.draw_op.Value(), set_pred.hint.Value(), set_pred.continue_bit.Value(),
+              set_pred.Address());
+    const PredOp op = set_pred.pred_op.Value();
+    switch (op) {
+    case PredOp::Zpass:
+    case PredOp::PrimCount:
+    case PredOp::Bool64:
+    case PredOp::Bool32:
+        predication.enabled = true;
+        predication.predicate = {
+            .op = static_cast<DrawPredicate::Op>(op),
+            .inverted = set_pred.draw_op.Value() == 0,
+            .hint = set_pred.hint.Value() == 1,
+            .continue_bit = is_continue,
+            .address = set_pred.Address(),
+        };
+        break;
+    case PredOp::Disable:
+        predication_result.store(true, std::memory_order_release);
+        predication.enabled = false;
+        predication.predicate = {};
+        break;
+    default:
+        LOG_WARNING(Render, "Unknown {}IT_SET_PREDICATION pred_op {} addr={:#x}",
+                    compute ? "compute " : "", static_cast<u32>(op), set_pred.Address());
+        predication.enabled = false;
+        predication.predicate = {};
+        break;
+    }
+}
+
+void Liverpool::ExecuteCopyData(const PM4CmdCopyData& copy_data) {
+    const u32 copy_bytes = copy_data.count_sel.Value() ? sizeof(u64) : sizeof(u32);
+    auto* memory = Core::Memory::Instance();
+    const auto mapped = [&](VAddr address) {
+        return address != 0 && memory && memory->ClampRangeSize(address, copy_bytes) == copy_bytes;
+    };
+    u64 value = 0;
+    switch (copy_data.src_sel.Value()) {
+    case CopyDataSrc::Immediate:
+        value = copy_data.src_addr_lo | (u64(copy_data.src_addr_hi) << 32);
+        break;
+    case CopyDataSrc::Memory:
+    case CopyDataSrc::TCL2: {
+        const VAddr src_addr = copy_data.SrcAddress<VAddr>();
+        if (!mapped(src_addr)) {
+            LOG_WARNING(Render, "IT_COPY_DATA from unmapped memory {:#x}", src_addr);
+            return;
+        }
+        u32 low = 0;
+        if (copy_bytes == sizeof(u32) && rasterizer && PendingFenceValue(src_addr, low)) {
+            value = low; // a fence before this packet, not written yet
+            break;
+        }
+        if (rasterizer) {
+            rasterizer->ReadMemory(src_addr, copy_bytes);
+        }
+        runtime_memory_read_backing(src_addr, &value, copy_bytes);
+        break;
+    }
+    case CopyDataSrc::GpuClock:
+        value = Libraries::Kernel::sceKernelReadTsc();
+        break;
+    default:
+        LOG_WARNING(Render, "unhandled IT_COPY_DATA src_sel = {}", u32(copy_data.src_sel.Value()));
+        return;
+    }
+
+    switch (copy_data.dst_sel.Value()) {
+    case CopyDataDst::MemorySync:
+    case CopyDataDst::MemoryAsync:
+    case CopyDataDst::TCL2: {
+        const VAddr dst_addr = copy_data.DstAddress<VAddr>();
+        if (!mapped(dst_addr)) {
+            LOG_WARNING(Render, "IT_COPY_DATA to unmapped memory {:#x}", dst_addr);
+            return;
+        }
+        // As WRITE_DATA: not before the copies reading it and the fences deferred earlier.
+        if (rasterizer) {
+            rasterizer->WaitHostCopiesFor(dst_addr, copy_bytes);
+            rasterizer->WaitDeferredSignals();
+        }
+        BbFreeCheck::Check(dst_addr, copy_bytes, &value, BbFreeCheck::WriteData);
+        BbClobber::NoteWrite(dst_addr, value, copy_bytes, BbClobber::WriteData);
+        if (!memory->TryWriteBacking(reinterpret_cast<void*>(dst_addr), &value, copy_bytes)) {
+            StoreLabel(reinterpret_cast<void*>(dst_addr), value, copy_bytes);
+        }
+        if (rasterizer) {
+            rasterizer->NoteCommandWrite(dst_addr, &value, copy_bytes, false);
+        }
+        break;
+    }
+    default:
+        LOG_WARNING(Render, "unhandled IT_COPY_DATA dst_sel = {}", u32(copy_data.dst_sel.Value()));
+        break;
+    }
 }
 
 Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
@@ -809,6 +980,14 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::IndirectBufferConst: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            if (indirect_buffer->chain.Value() == 1) {
+                // A chained buffer replaces the current one (the CP never comes back to it).
+                LOG_TRACE(Render, "CE IndirectBufferConst chained to {:p}, size={}",
+                          static_cast<const void*>(indirect_buffer->Address<const u32>()),
+                          indirect_buffer->ib_size.Value());
+                ccb = {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size.Value()};
+                continue;
+            }
             auto task =
                 ProcessCeUpdate({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
             RESUME_CE(task);
@@ -1190,8 +1369,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         RESUME_GFX(ce_task);
     }
 
-    const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
-    const std::size_t dcb_dwords = dcb.size();
+    auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+    std::size_t dcb_dwords = dcb.size();
     while (!dcb.empty()) {
         BbPm4::Lap(BbPm4::Graphics, 0); // lab: time between packets
         ProcessCommands();
@@ -1235,6 +1414,23 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
             BbPm4::Count(BbPm4::Graphics, static_cast<u32>(opcode));
+            predication.is_packet_predicated =
+                header->type3.predicate.Value() == PM4Predicate::PredEnable;
+            if (opcode == PM4ItOpcode::DrawIndex2) {
+                // A predicated draw the GPU skips still sets the index base: the one before
+                // it is restored at the next SET_PREDICATION.
+                if (predication.is_packet_predicated && predication.enabled) {
+                    if (!saved_index_base) {
+                        saved_index_base.emplace(
+                            static_cast<u32>(regs.index_base_address.base_addr_lo),
+                            static_cast<u32>(regs.index_base_address.base_addr_hi));
+                    }
+                } else {
+                    saved_index_base.reset();
+                }
+            } else if (opcode == PM4ItOpcode::IndexBase) {
+                saved_index_base.reset();
+            }
             ApplyGraphicsRegisterPacket(regs, header, gfx_reg_checksum, &pipe_dirty);
             // lab: the native renderer draws the frame alone (BB_VK_ALONE=1) and takes its draws
             // from the engine; shadPS4 dropped its own draws only at the end of Rasterizer::Draw,
@@ -1307,7 +1503,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::ContextControl: {
                 break;
             }
-            case PM4ItOpcode::ClearState:
+            case PM4ItOpcode::ClearState: {
+                // registers: ApplyGraphicsRegisterPacket
+                predication = {};
+                saved_index_base.reset();
+                predication_result.store(true, std::memory_order_release);
+                break;
+            }
             case PM4ItOpcode::SetConfigReg: {
                 break; // registers: ApplyGraphicsRegisterPacket
             }
@@ -1399,7 +1601,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break; // registers: ApplyGraphicsRegisterPacket
             }
             case PM4ItOpcode::SetPredication: {
-                LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
+                // The draw pipe ran dry before this packet: the draws before it were recorded
+                // with the predication they were decoded with.
+                RestorePredicatedIndexBase();
+                ApplySetPredication(*reinterpret_cast<const PM4CmdSetPredication*>(header),
+                                    false);
                 break;
             }
             case PM4ItOpcode::IndexType: {
@@ -1601,24 +1807,96 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWrite: {
                 const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+                const auto* dwords = reinterpret_cast<const u32*>(header);
+                const EventType event_type = event->event_type.Value();
+                const EventIndex event_index = event->event_index.Value();
                 LOG_DEBUG(Render, "Encountered EventWrite: event_type = {}, event_index = {}",
-                          magic_enum::enum_name(event->event_type.Value()),
-                          magic_enum::enum_name(event->event_index.Value()));
-                if (event->event_type.Value() == EventType::SoVgtStreamoutFlush) {
+                          magic_enum::enum_name(event_type), magic_enum::enum_name(event_index));
+                if (event_type == EventType::SoVgtStreamoutFlush) {
                     // registers: ApplyGraphicsRegisterPacket
-                } else if (event->event_index.Value() == EventIndex::ZpassDone) {
-                    if (event->event_type.Value() == EventType::PixelPipeStatDump) {
+                } else if (event_type == EventType::PixelPipeStatControl && count >= 2) {
+                    const u32 control = dwords[2];
+                    static constexpr std::array<u32, 4> Strides = {4, 8, 16, 32};
+                    pipe_stat_control.stride = Strides[(control >> 9) & 0x3];
+                    pipe_stat_control.instance_mask = (control >> 11) & 0x1fffff;
+                    pipe_stat_control.num_dbs = std::popcount(pipe_stat_control.instance_mask);
+                    if (pipe_stat_control.num_dbs == 0) {
+                        pipe_stat_control.num_dbs = num_counter_pairs;
+                    }
+                    LOG_TRACE(Render, "EventWrite: PixelPipeStatControl num_dbs = {}, stride = {}",
+                              pipe_stat_control.num_dbs, pipe_stat_control.stride);
+                } else if ((event_type == EventType::PixelPipeStatDump ||
+                            event_type == EventType::ZpassDone ||
+                            event_index == EventIndex::ZpassDone) &&
+                           count >= 3) {
+                    const VAddr addr = (u64(dwords[3]) << 32u) | u64(dwords[2]);
+                    const u32 num_dbs =
+                        pipe_stat_control.num_dbs ? pipe_stat_control.num_dbs : num_counter_pairs;
+                    const u32 stride = pipe_stat_control.stride ? pipe_stat_control.stride : 16;
+                    LOG_TRACE(Render,
+                              "EventWrite: occlusion stats dump to {:#x}, num_dbs = {}, stride = {}",
+                              addr, num_dbs, stride);
+                    if (rasterizer) {
+                        // In order with the draws: the occlusion queries of those before it end
+                        // there (vk_occlusion.h); the results are written once the GPU is done.
+                        const OcclusionDumpTask task{addr, num_dbs, stride};
+                        rasterizer->RunInOrder(&RunOcclusionDump, &task, sizeof(task),
+                                               BbToggle::PipelinedTasks, false);
+                    } else {
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
-                        static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
-                        u64* results = event->Address<u64*>();
-                        for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
-                            *results = pixel_counter | OcclusionCounterValidMask;
-                            if (rasterizer) {
-                                rasterizer->NoteLateCommandWrite(reinterpret_cast<VAddr>(results),
-                                                                 results, sizeof(*results));
+                        auto* memory = Core::Memory::Instance();
+                        if (addr != 0 && memory &&
+                            memory->ClampRangeSize(addr, u64(num_dbs) * stride) ==
+                                u64(num_dbs) * stride) {
+                            for (u32 i = 0; i < num_dbs; ++i) {
+                                StoreLabel(reinterpret_cast<void*>(addr + u64(i) * stride),
+                                           pixel_counter | OcclusionCounterValidMask, sizeof(u64));
                             }
                         }
-                        pixel_counter += OcclusionCounterStep;
+                        pixel_counter += 0x2FFFFFFULL;
+                    }
+                } else if (event_index == EventIndex::SampleStreamoutStatSx ||
+                           event_index == EventIndex::SamplePipelineStat ||
+                           event_type == EventType::SampleStreamoutStats ||
+                           event_type == EventType::SampleStreamoutStats1 ||
+                           event_type == EventType::SampleStreamoutStats2 ||
+                           event_type == EventType::SampleStreamoutStats3 ||
+                           event_type == EventType::SamplePipelineStat) {
+                    if (count >= 3) {
+                        const VAddr addr = (u64(dwords[3]) << 32u) | u64(dwords[2]);
+                        u32 stream = 0;
+                        switch (event_type) {
+                        case EventType::SampleStreamoutStats1:
+                            stream = 1;
+                            break;
+                        case EventType::SampleStreamoutStats2:
+                            stream = 2;
+                            break;
+                        case EventType::SampleStreamoutStats3:
+                            stream = 3;
+                            break;
+                        default:
+                            stream = 0;
+                            break;
+                        }
+                        LOG_TRACE(Render, "EventWrite: primitive stats sample stream {} to {:#x}",
+                                  stream, addr);
+                        if (rasterizer) {
+                            // In order with the draws it counts.
+                            const StreamoutDumpTask task{addr, stream, 0};
+                            rasterizer->RunInOrder(&RunStreamoutDump, &task, sizeof(task),
+                                                   BbToggle::PipelinedTasks, false);
+                        } else {
+                            static constexpr u64 StreamoutCounterValidMask = 0x8000000000000000ULL;
+                            auto* memory = Core::Memory::Instance();
+                            if (addr != 0 && memory &&
+                                memory->ClampRangeSize(addr, sizeof(u64) * 2) == sizeof(u64) * 2) {
+                                const u64 value = streamout_counter | StreamoutCounterValidMask;
+                                StoreLabel(reinterpret_cast<void*>(addr), value, sizeof(u64));
+                                StoreLabel(reinterpret_cast<void*>(addr + 8), value, sizeof(u64));
+                            }
+                            streamout_counter += 1000ULL;
+                        }
                     }
                 }
                 break;
@@ -1712,13 +1990,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::CopyData: {
-                const auto* copy_data = reinterpret_cast<const PM4CmdCopyData*>(header);
-                LOG_WARNING(Render,
-                            "unhandled IT_COPY_DATA src_sel = {}, dst_sel = {}, "
-                            "count_sel = {}, wr_confirm = {}, engine_sel = {}",
-                            u32(copy_data->src_sel.Value()), u32(copy_data->dst_sel.Value()),
-                            copy_data->count_sel.Value(), copy_data->wr_confirm.Value(),
-                            u32(copy_data->engine_sel.Value()));
+                // The draw pipe ran dry before this packet (not pipelined).
+                ExecuteCopyData(*reinterpret_cast<const PM4CmdCopyData*>(header));
                 break;
             }
             case PM4ItOpcode::MemSemaphore: {
@@ -1790,8 +2063,19 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+                if (indirect_buffer->chain.Value() == 1) {
+                    // A chained buffer replaces the current one: the CP never comes back to the
+                    // rest of this buffer, which in reused segments still holds old commands.
+                    LOG_TRACE(Render, "IndirectBuffer chained to {:p}, size={}",
+                              static_cast<const void*>(indirect_buffer->Address<const u32>()),
+                              indirect_buffer->ib_size.Value());
+                    dcb = {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size.Value()};
+                    base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+                    dcb_dwords = dcb.size();
+                    continue;
+                }
                 auto task = ProcessGraphics(
-                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size.Value()}, {});
                 // Tasks start suspended: the nested body (and its scan) runs on this resume.
                 g_dcb_depth = dcb_depth + 1;
                 RESUME_GFX(task);
@@ -1832,15 +2116,39 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 LOG_WARNING(Render_Vulkan, "Unimplemented IT_GET_LOD_STATS");
                 break;
             }
+            case PM4ItOpcode::OcclusionQuery: {
+                const auto* occ_query = reinterpret_cast<const PM4CmdOcclusionQuery*>(header);
+                LOG_TRACE(Render, "IT_OCCLUSION_QUERY start={:#x} query={:#x}",
+                          occ_query->StartAddress(), occ_query->QueryAddress());
+                break;
+            }
             case PM4ItOpcode::CondExec: {
+                // Not pipelined: the draws before it are recorded, and the fences they queued
+                // count as written (ReadCommandValue).
                 const auto* cond_exec = reinterpret_cast<const PM4CmdCondExec*>(header);
-                if (cond_exec->command.Value() != 0) {
-                    LOG_WARNING(Render, "IT_COND_EXEC used a reserved command");
+                if (count < 4 && cond_exec->command.Value() != 0) {
+                    LOG_WARNING(Render, "IT_COND_EXEC used a reserved command {}",
+                                cond_exec->command.Value());
                 }
-                const auto skip = *cond_exec->Address() == false;
-                if (skip) {
-                    dcb = NextPacket(dcb,
-                                     header->type3.NumWords() + 1 + cond_exec->exec_count.Value());
+                const VAddr address = cond_exec->Address();
+                u32 value = 1;
+                if (!ReadCommandValue(address, value)) {
+                    LOG_WARNING(Render, "IT_COND_EXEC: invalid condition address {:#x}", address);
+                    value = 1;
+                }
+                LOG_TRACE(Render, "IT_COND_EXEC: addr = {:#x}, value = {}, exec_count = {}",
+                          address, value, cond_exec->ExecCount());
+                if (value == 0) {
+                    dcb = NextPacket(dcb, count + 1 + cond_exec->ExecCount());
+                    continue;
+                }
+                break;
+            }
+            case PM4ItOpcode::PredExec: {
+                const auto* pred_exec = reinterpret_cast<const PM4CmdPredExec*>(header);
+                if (!GetPredicationAccumulatedResult()) {
+                    LOG_TRACE(Render, "IT_PRED_EXEC: skipping {} dwords", pred_exec->ExecCount());
+                    dcb = NextPacket(dcb, count + 1 + pred_exec->ExecCount());
                     continue;
                 }
                 break;
@@ -1951,8 +2259,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             UNREACHABLE_MSG("Invalid PM4 type {}", header->type.Value());
         }
 
+        const u32 count = header->type3.NumWords();
         const PM4ItOpcode opcode = header->type3.opcode;
         BbPm4::Count(BbPm4::Compute, static_cast<u32>(opcode));
+        predication.is_packet_predicated =
+            header->type3.predicate.Value() == PM4Predicate::PredEnable;
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
@@ -1962,8 +2273,20 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::IndirectBuffer: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            if constexpr (is_indirect) {
+                if (indirect_buffer->chain.Value() == 1) {
+                    // As for graphics, a chained buffer replaces the current one.
+                    LOG_TRACE(Render, "Compute IndirectBuffer chained to {:p}, size={}",
+                              static_cast<const void*>(indirect_buffer->Address<const u32>()),
+                              indirect_buffer->ib_size.Value());
+                    acb = {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size.Value()};
+                    base_addr = reinterpret_cast<VAddr>(acb.data());
+                    acb_size = acb.size_bytes();
+                    continue;
+                }
+            }
             auto task = ProcessCompute<true>(
-                {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid);
+                {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size.Value()}, vqid);
             RESUME_ASC(task, vqid);
 
             while (!task.handle.done()) {
@@ -2214,9 +2537,58 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             // const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
             break;
         }
+        case PM4ItOpcode::SetPredication: {
+            ApplySetPredication(*reinterpret_cast<const PM4CmdSetPredication*>(header), true);
+            break;
+        }
+        case PM4ItOpcode::CopyData: {
+            ExecuteCopyData(*reinterpret_cast<const PM4CmdCopyData*>(header));
+            break;
+        }
+        case PM4ItOpcode::CondExec: {
+            const auto* cond_exec = reinterpret_cast<const PM4CmdCondExec*>(header);
+            if (count < 4 && cond_exec->command.Value() != 0) {
+                LOG_WARNING(Render, "Compute IT_COND_EXEC used a reserved command {}",
+                            cond_exec->command.Value());
+            }
+            const VAddr address = cond_exec->Address();
+            u32 value = 1;
+            if (!ReadCommandValue(address, value)) {
+                LOG_WARNING(Render, "Compute IT_COND_EXEC: invalid condition address {:#x}",
+                            address);
+                value = 1;
+            }
+            LOG_TRACE(Render, "Compute IT_COND_EXEC: addr = {:#x}, value = {}, exec_count = {}",
+                      address, value, cond_exec->ExecCount());
+            if (value == 0) {
+                const u32 skip_words = next_dw_off + cond_exec->ExecCount();
+                acb = NextPacket(acb, skip_words);
+                if constexpr (!is_indirect) {
+                    *queue.read_addr += skip_words;
+                    *queue.read_addr %= queue.ring_size_dw;
+                }
+                continue;
+            }
+            break;
+        }
+        case PM4ItOpcode::PredExec: {
+            const auto* pred_exec = reinterpret_cast<const PM4CmdPredExec*>(header);
+            if (!GetPredicationAccumulatedResult()) {
+                LOG_TRACE(Render, "Compute IT_PRED_EXEC: skipping {} dwords",
+                          pred_exec->ExecCount());
+                const u32 skip_words = next_dw_off + pred_exec->ExecCount();
+                acb = NextPacket(acb, skip_words);
+                if constexpr (!is_indirect) {
+                    *queue.read_addr += skip_words;
+                    *queue.read_addr %= queue.ring_size_dw;
+                }
+                continue;
+            }
+            break;
+        }
         default:
             UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
-                            static_cast<u32>(opcode), header->type3.NumWords());
+                            static_cast<u32>(opcode), count);
         }
 
         acb = NextPacket(acb, next_dw_off);
