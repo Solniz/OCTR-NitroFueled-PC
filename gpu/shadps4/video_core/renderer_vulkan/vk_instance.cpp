@@ -299,7 +299,8 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE,
 #endif
         vk::PhysicalDeviceCooperativeMatrixFeaturesKHR, vk::PhysicalDeviceShaderFloat8FeaturesEXT,
-        vk::PhysicalDeviceFaultFeaturesEXT>();
+        vk::PhysicalDeviceFaultFeaturesEXT, vk::PhysicalDeviceConditionalRenderingFeaturesEXT,
+        vk::PhysicalDeviceTransformFeedbackFeaturesEXT>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -467,6 +468,24 @@ bool Instance::CreateDevice() {
     if (compute_shader_derivatives) {
         compute_shader_derivatives_features =
             feature_chain.get<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
+    }
+    conditional_rendering = add_extension(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+    if (conditional_rendering) {
+        conditional_rendering_features =
+            feature_chain.get<vk::PhysicalDeviceConditionalRenderingFeaturesEXT>();
+        LOG_INFO(Render_Vulkan, "- conditionalRendering: {}",
+                 conditional_rendering_features.conditionalRendering);
+        LOG_INFO(Render_Vulkan, "- inheritedConditionalRendering: {}",
+                 conditional_rendering_features.inheritedConditionalRendering);
+    }
+    transform_feedback = add_extension(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
+    if (transform_feedback) {
+        transform_feedback_features =
+            feature_chain.get<vk::PhysicalDeviceTransformFeedbackFeaturesEXT>();
+        LOG_INFO(Render_Vulkan, "- transformFeedback: {}",
+                 transform_feedback_features.transformFeedback);
+        LOG_INFO(Render_Vulkan, "- geometryStreams: {}",
+                 transform_feedback_features.geometryStreams);
     }
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (shader_clock) {
@@ -719,6 +738,15 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderClockFeaturesKHR{
             .shaderSubgroupClock = shader_clock_features.shaderSubgroupClock,
         },
+        vk::PhysicalDeviceConditionalRenderingFeaturesEXT{
+            .conditionalRendering = conditional_rendering_features.conditionalRendering,
+            .inheritedConditionalRendering =
+                conditional_rendering_features.inheritedConditionalRendering,
+        },
+        vk::PhysicalDeviceTransformFeedbackFeaturesEXT{
+            .transformFeedback = transform_feedback_features.transformFeedback,
+            .geometryStreams = transform_feedback_features.geometryStreams,
+        },
         vk::PhysicalDeviceCoverageReductionModeFeaturesNV{
             .coverageReductionMode = true,
         },
@@ -798,6 +826,12 @@ bool Instance::CreateDevice() {
     }
     if (!shader_clock) {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
+    }
+    if (!conditional_rendering) {
+        device_chain.unlink<vk::PhysicalDeviceConditionalRenderingFeaturesEXT>();
+    }
+    if (!transform_feedback) {
+        device_chain.unlink<vk::PhysicalDeviceTransformFeedbackFeaturesEXT>();
     }
     if (!compute_shader_derivatives) {
         device_chain.unlink<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
