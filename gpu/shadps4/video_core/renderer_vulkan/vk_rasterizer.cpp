@@ -26,6 +26,7 @@
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/kernel/process.h"
 #include "core/memory.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -50,6 +51,9 @@ extern "C" void runtime_memory_read_backing(std::uintptr_t, void*, std::uint64_t
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace Vulkan {
+
+/// DB_COUNT_CONTROL (ZPASS_INCREMENT_DISABLE in bit 0).
+static constexpr u32 DbCountControl = 0xA001;
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -94,9 +98,13 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     }
     // bbport: this thread joins the texture binding helper before it changes image state.
     runtime.SetImageAccessHook(&JoinBindHelper, this);
+    occlusion = std::make_unique<OcclusionCounter>(
+        instance, scheduler, buffer_cache, Libraries::Kernel::sceKernelIsNeoMode() ? 16u : 8u);
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
         buffer_cache.SubmitPendingArenaBinds(info);
+        // Called once the submission's tick is taken: CurrentTick() - 1 is what it signals.
+        occlusion->OnSubmit(scheduler.CurrentTick() - 1);
     });
 }
 
@@ -199,6 +207,10 @@ bool Rasterizer::SignalsPublished(u64 position) const {
 bool Rasterizer::HasUnsubmittedSignals() {
     if (local_signal_count.load(std::memory_order_acquire) != 0) {
         return true; // for the current tick, held by the recording thread
+    }
+    // Occlusion results are written once their submission has run: the guest may wait for them.
+    if (occlusion && occlusion->HasUnsubmittedDumps()) {
+        return true;
     }
     std::scoped_lock lk{gpu_signals_mutex};
     return !gpu_signals.empty() && gpu_signals.back().tick >= scheduler.CurrentTick();
@@ -735,6 +747,7 @@ struct DrawPacket {
     u32 num_vsharps; ///< V#s of the vertex streams, after the indirect arguments
     u32 pad;
     u64 ring_end; ///< constant ring position after this packet's copies
+    AmdGpu::DrawPredicate predicate; ///< SET_PREDICATION of a predicated packet
 };
 struct PacketStage {
     const Shader::Info* info;
@@ -1105,6 +1118,7 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     packet.db_extent = liverpool->last_db_extent;
     packet.ring_end = constant_ring ? constant_ring->Position() : 0;
     packet.num_vsharps = static_cast<u32>(vsharps.size());
+    packet.predicate = pipeline ? liverpool->CurrentPredicate() : AmdGpu::DrawPredicate{};
     out += sizeof(DrawPacket);
     std::memcpy(out, blocks.data(), num_blocks * sizeof(u16));
     out += AlignPacket(num_blocks * sizeof(u16));
@@ -1316,6 +1330,7 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     stage_regs = &regs;
     self.pipe_cb_extent = packet.cb_extent;
     self.pipe_db_extent = packet.db_extent;
+    self.draw_predicate = packet.predicate;
     if (packet.kind == PacketKind::Special) {
         // A draw FilterDraw handles (fast clear elimination, resolve, depth copy, skip).
         FrameCapture::Poll();
@@ -1340,6 +1355,7 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     Shader::Info::num_ud_snapshots = 0;
     self.num_ring_stages = 0;
     self.packet_vsharps = {};
+    self.draw_predicate = {};
     if (self.constant_ring) {
         self.constant_ring->Stamp(packet.ring_end);
     }
@@ -1500,7 +1516,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
         PostDraw(pipeline, used_prepared, is_indexed, index_offset);
         return;
     }
+    draw_predicate = liverpool->CurrentPredicate(); // the draw pipe is idle here
     DrawRecord(pipeline, used_prepared, is_indexed, index_offset);
+    draw_predicate = {};
 }
 
 void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw* used_prepared,
@@ -1510,6 +1528,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (DrawPipe::OnStageB()) {
         FrameCapture::Poll();
         scheduler.PopPendingOperations();
+    }
+    const PredicateScope predicate = EvaluatePredicate();
+    if (predicate.skip) {
+        return;
     }
     // bbport (BB_PREUPLOAD): once a frame, guest GPU memory the CPU wrote and then left alone is
     // uploaded ahead of its use, BB_PREUPLOAD_MB (16) at most per frame.
@@ -1707,6 +1729,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
     MarkDraw(pipeline);
+    occlusion->BeforeDraw(regs.reg_array[DbCountControl]);
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
@@ -1751,12 +1774,38 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     };
     scheduler.RecordCrumb(crumb, [=](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        predicate.Begin(cmdbuf);
         if (is_indexed) {
             cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(first_vertex), first_instance);
         } else {
             cmdbuf.draw(num_indices, num_instances, first_vertex, first_instance);
         }
+        predicate.End(cmdbuf);
     });
+    EndPredicate(predicate);
+    {
+        u32 prims = 0;
+        switch (regs.primitive_type) {
+        case AmdGpu::PrimitiveType::PointList:
+            prims = num_indices;
+            break;
+        case AmdGpu::PrimitiveType::LineList:
+            prims = num_indices / 2;
+            break;
+        case AmdGpu::PrimitiveType::LineStrip:
+            prims = num_indices > 1 ? num_indices - 1 : 0;
+            break;
+        case AmdGpu::PrimitiveType::TriangleStrip:
+            prims = num_indices > 2 ? num_indices - 2 : 0;
+            break;
+        case AmdGpu::PrimitiveType::TriangleList:
+        case AmdGpu::PrimitiveType::RectList:
+        default:
+            prims = num_indices / 3;
+            break;
+        }
+        CountStreamoutPrimitives(u64(prims) * std::max(1u, num_instances));
+    }
     if (FrameCapture::Active()) {
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         FrameCapture::Draw(vs_info.pgm_hash, ps ? ps->pgm_hash : 0, num_indices, num_instances);
@@ -1809,7 +1858,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         PostDraw(pipeline, nullptr, is_indexed, 0, nullptr, &indirect);
         return;
     }
+    draw_predicate = liverpool->CurrentPredicate();
     DrawIndirectRecord(pipeline, is_indexed, indirect);
+    draw_predicate = {};
 }
 
 void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,
@@ -1818,6 +1869,10 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     if (DrawPipe::OnStageB()) {
         FrameCapture::Poll();
         scheduler.PopPendingOperations();
+    }
+    const PredicateScope predicate = EvaluatePredicate();
+    if (predicate.skip) {
+        return;
     }
     const VAddr count_address = indirect.count;
     const u32 stride = indirect.stride;
@@ -1876,6 +1931,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
     MarkDraw(pipeline);
+    occlusion->BeforeDraw(Regs().reg_array[DbCountControl]);
 
     ASSERT(stride == (is_indexed ? sizeof(VkDrawIndexedIndirectCommand)
                                  : sizeof(VkDrawIndirectCommand)));
@@ -1896,6 +1952,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     };
     scheduler.RecordCrumb(crumb, [=](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+        predicate.Begin(cmdbuf);
         if (is_indexed) {
             if (counts) {
                 cmdbuf.drawIndexedIndirectCount(args, args_offset, counts, counts_offset, max_count,
@@ -1908,7 +1965,11 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         } else {
             cmdbuf.drawIndirect(args, args_offset, max_count, stride);
         }
+        predicate.End(cmdbuf);
     });
+    EndPredicate(predicate);
+    // The primitive counts are on the GPU: an estimate per draw.
+    CountStreamoutPrimitives(u64(max_count) * 100ULL);
     DebugState.IncDrawCall();
 
     ResetBindings(false);
@@ -1920,6 +1981,10 @@ void Rasterizer::DispatchDirect() {
     BbStats::dispatches.fetch_add(1, std::memory_order_relaxed);
     // bbport: like draws, handed to the draw recording thread after the pipeline selection.
     const bool pipelined = UseDrawPipe() && !BbToggle::Disabled(BbToggle::PipelinedDispatch);
+    if (const auto& cs = CsRegs(); cs.dim_x == 0 || cs.dim_y == 0 || cs.dim_z == 0 ||
+                                   cs.address == 0) {
+        return; // nothing to run
+    }
     if (!pipelined) {
         DrainDrawPipe();
     }
@@ -1931,7 +1996,9 @@ void Rasterizer::DispatchDirect() {
         PostDraw(pipeline, nullptr, false, 0, &CsRegs());
         return;
     }
+    draw_predicate = liverpool->CurrentPredicate();
     DispatchRecord(pipeline);
+    draw_predicate = {};
 }
 
 void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
@@ -1943,6 +2010,10 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     fsr_pending = false;
 
     scheduler.PopPendingOperations();
+    const PredicateScope predicate = EvaluatePredicate();
+    if (predicate.skip) {
+        return;
+    }
 
     const auto& cs_program = CsRegs();
 
@@ -2056,8 +2127,11 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     };
     scheduler.RecordCrumb(crumb, [=](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        predicate.Begin(cmdbuf);
         cmdbuf.dispatch(dim_x, dim_y, dim_z);
+        predicate.End(cmdbuf);
     });
+    EndPredicate(predicate);
     DebugState.IncDispatch();
 
     ResetBindings(true);
@@ -2080,7 +2154,9 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         PostDraw(pipeline, nullptr, false, 0, &CsRegs(), &indirect);
         return;
     }
+    draw_predicate = liverpool->CurrentPredicate();
     DispatchIndirectRecord(pipeline, address + offset, size);
+    draw_predicate = {};
 }
 
 void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr address,
@@ -2088,6 +2164,10 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
     buffer_cache.NewPacket();
     fsr_pending = false;
     scheduler.PopPendingOperations();
+    const PredicateScope predicate = EvaluatePredicate();
+    if (predicate.skip) {
+        return;
+    }
     const u32 offset = 0;
 
     if (!BindResources(pipeline)) {
@@ -2121,12 +2201,186 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
     scheduler.RecordCrumb(crumb, [=](vk::CommandBuffer cmdbuf) {
         Breadcrumbs::CopyArgs(cmdbuf, args, args_offset, args_slot);
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        predicate.Begin(cmdbuf);
         cmdbuf.dispatchIndirect(args, args_offset);
+        predicate.End(cmdbuf);
     });
+    EndPredicate(predicate);
     DebugState.IncDispatch();
 
     ResetBindings(true);
     scheduler.KickRecording();
+}
+
+// bbport: SET_PREDICATION, evaluated where the draw or dispatch is recorded (in stream order
+// with the draws before it). Results known on the CPU skip the command; otherwise conditional
+// rendering decides on the GPU (VK_EXT_conditional_rendering); with nothing to go by the command
+// is recorded (the hardware's "draw if not final" behaviour, never culling on unready results).
+Rasterizer::PredicateScope Rasterizer::EvaluatePredicate() {
+    PredicateScope scope{};
+    const AmdGpu::DrawPredicate predicate = draw_predicate;
+    if (!predicate) {
+        return scope;
+    }
+    using Op = AmdGpu::DrawPredicate::Op;
+    if (predicate.continue_bit && !liverpool->GetPredicationAccumulatedResult()) {
+        scope.skip = true;
+        return scope;
+    }
+    const auto decide = [&](bool draw) {
+        scope.skip = !draw;
+        liverpool->SetPredicationAccumulatedResult(draw, predicate.continue_bit);
+    };
+    // A guest value read in stream order: GPU-written data is downloaded first.
+    const auto read_guest = [&](VAddr address, void* out, u64 size) {
+        if (address == 0 || memory->ClampRangeSize(address, size) != size) {
+            return false;
+        }
+        if (buffer_cache.IsRegionGpuModified(address, size)) {
+            ReadMemory(address, size);
+        }
+        runtime_memory_read_backing(address, out, size);
+        return true;
+    };
+
+    switch (predicate.op) {
+    case Op::Zpass: {
+        const bool draw_if_visible = !predicate.inverted;
+        const ZpassPredicate result = occlusion->EvaluateZpass(predicate.address, draw_if_visible);
+        switch (result.kind) {
+        case ZpassPredicate::Kind::Visible:
+        case ZpassPredicate::Kind::Occluded: {
+            const bool visible = result.kind == ZpassPredicate::Kind::Visible;
+            if (visible != draw_if_visible) {
+                LOG_TRACE(Render_Vulkan, "Predication Zpass at {:#x}: culled (visible={})",
+                          predicate.address, visible);
+            }
+            decide(visible == draw_if_visible);
+            break;
+        }
+        case ZpassPredicate::Kind::Gpu:
+            // The pass wrote draw-if-visible and draw-if-occluded words: no inversion here.
+            scope.active = true;
+            scope.buffer = occlusion->PredicateBuffer();
+            scope.offset = result.offset;
+            scope.inverted = false;
+            break;
+        case ZpassPredicate::Kind::Unknown:
+            LOG_TRACE(Render_Vulkan,
+                      "Predication Zpass at {:#x}: results not ready, drawing conservatively",
+                      predicate.address);
+            decide(true);
+            break;
+        }
+        return scope;
+    }
+    case Op::PrimCount: {
+        static constexpr u64 ValidMask = 0x8000000000000000ULL;
+        const bool draw_if_no_overflow = !predicate.inverted;
+        // {begin needed, begin written, end needed, end written}, or one sample.
+        std::array<u64, 4> q{};
+        if (read_guest(predicate.address, q.data(), sizeof(q)) &&
+            (q[0] & q[1] & q[2] & q[3] & ValidMask) != 0) {
+            const u64 needed = (q[2] - q[0]) & ~ValidMask;
+            const u64 written = (q[3] - q[1]) & ~ValidMask;
+            decide((needed == written) == draw_if_no_overflow);
+            return scope;
+        }
+        if (read_guest(predicate.address, q.data(), sizeof(u64) * 2) &&
+            (q[0] & q[1] & ValidMask) != 0) {
+            const u64 needed = q[0] & ~ValidMask;
+            const u64 written = q[1] & ~ValidMask;
+            decide((needed == written) == draw_if_no_overflow);
+            return scope;
+        }
+        LOG_TRACE(Render_Vulkan,
+                  "Predication PrimCount at {:#x}: results not ready, drawing conservatively",
+                  predicate.address);
+        decide(true);
+        return scope;
+    }
+    case Op::Bool64:
+    case Op::Bool32: {
+        const u32 size = predicate.op == Op::Bool32 ? sizeof(u32) : sizeof(u64);
+        if (instance.IsConditionalRenderingSupported()) {
+            // Read by the GPU in stream order (only the low 32 bits of a 64-bit predicate).
+            const auto [buffer, offset] = buffer_cache.ObtainBuffer(predicate.address, size, false);
+            if (buffer) {
+                needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size);
+                scope.active = true;
+                scope.buffer = buffer->Handle();
+                scope.offset = offset;
+                scope.inverted = predicate.inverted;
+                scope.tracked = buffer;
+                scope.size = size;
+                return scope;
+            }
+            LOG_WARNING(Render_Vulkan, "Predicate at {:#x} not found in the buffer cache",
+                        predicate.address);
+        }
+        u64 value = 1;
+        if (!read_guest(predicate.address, &value, size)) {
+            value = 1;
+        }
+        if (size == sizeof(u32)) {
+            value &= 0xFFFFFFFFull;
+        }
+        decide((value != 0) != predicate.inverted);
+        return scope;
+    }
+    case Op::None:
+        break;
+    }
+    return scope;
+}
+
+void Rasterizer::EndPredicate(const PredicateScope& scope) {
+    if (scope.active && scope.tracked) {
+        runtime.AccessBuffer(scope.tracked, scope.offset, scope.size,
+                             vk::PipelineStageFlagBits2::eConditionalRenderingEXT,
+                             vk::AccessFlagBits2::eConditionalRenderingReadEXT);
+    }
+}
+
+void Rasterizer::CountStreamoutPrimitives(u64 prim_count) {
+    const auto& config = Regs().vgt_strmout_config;
+    if (!config.raw) {
+        streamout_primitives[0] += prim_count;
+        return;
+    }
+    if (config.streamout_0_en) {
+        streamout_primitives[0] += prim_count;
+    }
+    if (config.streamout_1_en) {
+        streamout_primitives[1] += prim_count;
+    }
+    if (config.streamout_2_en) {
+        streamout_primitives[2] += prim_count;
+    }
+    if (config.streamout_3_en) {
+        streamout_primitives[3] += prim_count;
+    }
+}
+
+void Rasterizer::OcclusionDump(VAddr address, u32 num_dbs, u32 stride) {
+    occlusion->Dump(address, num_dbs, stride);
+}
+
+void Rasterizer::StreamoutDump(VAddr address, u32 stream) {
+    static constexpr u64 ValidMask = 0x8000000000000000ULL;
+    if (address == 0 || (address & 7) != 0 ||
+        memory->ClampRangeSize(address, sizeof(u64) * 2) != sizeof(u64) * 2) {
+        return;
+    }
+    // {primitives needed, primitives written}: equal, no overflow.
+    const u64 count = std::max<u64>(1ULL, streamout_primitives[std::min(stream, 3u)]);
+    const std::array<u64, 2> values = {count | ValidMask, count | ValidMask};
+    auto* ptr = reinterpret_cast<void*>(address);
+    if (!memory->TryWriteBacking(ptr, values.data(), sizeof(values))) {
+        __atomic_store_n(static_cast<u64*>(ptr), values[0], __ATOMIC_RELEASE);
+        __atomic_store_n(static_cast<u64*>(ptr) + 1, values[1], __ATOMIC_RELEASE);
+    }
+    NoteLateCommandWrite(address, values.data(), sizeof(values));
 }
 
 u64 Rasterizer::Flush() {
