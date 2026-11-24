@@ -509,11 +509,15 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         LOG_INFO(Render_Vulkan, "Buffer arenas of {} MiB (driver buffer limit {} MiB)",
                  arena_page_size >> 20, instance.GetMaxBufferSize() >> 20);
     }
+    vk::BufferUsageFlags arena_usage = ARENA_USAGE;
+    if (instance.IsConditionalRenderingSupported()) {
+        arena_usage |= vk::BufferUsageFlagBits::eConditionalRenderingEXT;
+    }
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
         .size = arena_page_size,
-        .usage = ARENA_USAGE,
+        .usage = arena_usage,
         .sharingMode = shared ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive,
         .queueFamilyIndexCount = shared ? 2u : 0u,
         .pQueueFamilyIndices = shared ? families.data() : nullptr,
