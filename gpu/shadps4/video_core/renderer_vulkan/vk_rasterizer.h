@@ -22,6 +22,8 @@
 #include "video_core/renderer_vulkan/vk_object_motion.h"
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_draw_prep.h"
+#include "video_core/amdgpu/liverpool.h"
+#include "video_core/renderer_vulkan/vk_occlusion.h"
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -251,6 +253,11 @@ public:
     void Finish();
     void OnSubmit();
 
+    /// ZPASS_DONE / PIXEL_PIPE_STAT_DUMP, in order with the draws (an ordered task).
+    void OcclusionDump(VAddr address, u32 num_dbs, u32 stride);
+    /// SAMPLE_STREAMOUTSTATS: the primitives counted for `stream`, in order with the draws.
+    void StreamoutDump(VAddr address, u32 stream);
+
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
     }
@@ -414,6 +421,39 @@ private:
     void EmitIndexBuffer();
 
     void ResetBindings(bool is_compute);
+
+    /// SET_PREDICATION for the draw or dispatch being recorded (draw_predicate).
+    struct PredicateScope {
+        bool skip = false;   ///< known false on the CPU: nothing is recorded
+        bool active = false; ///< conditional rendering on `buffer` around the command
+        bool inverted = false;
+        vk::Buffer buffer{};
+        u64 offset = 0;
+        const VideoCore::Buffer* tracked = nullptr; ///< a cache buffer read (barriers)
+        u32 size = 0;
+        void Begin(vk::CommandBuffer cmdbuf) const {
+            if (active) {
+                cmdbuf.beginConditionalRenderingEXT({
+                    .buffer = buffer,
+                    .offset = offset,
+                    .flags = inverted ? vk::ConditionalRenderingFlagBitsEXT::eInverted
+                                      : vk::ConditionalRenderingFlagsEXT{},
+                });
+            }
+        }
+        void End(vk::CommandBuffer cmdbuf) const {
+            if (active) {
+                cmdbuf.endConditionalRenderingEXT();
+            }
+        }
+    };
+    /// Evaluated where the command is recorded, before its render pass state (it may record a
+    /// compute pass, ZPASS on the GPU, or a barrier for the predicate).
+    PredicateScope EvaluatePredicate();
+    /// After the command is recorded: the predicate read is tracked for later writes.
+    void EndPredicate(const PredicateScope& scope);
+    /// Primitives a direct draw sends to the enabled streams (SAMPLE_STREAMOUTSTATS).
+    void CountStreamoutPrimitives(u64 prim_count);
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
@@ -678,6 +718,11 @@ private:
     std::unique_ptr<ConstantRing> constant_ring;
     /// Submissions (prepared draws) kept alive until stage B reaches the position.
     std::deque<std::pair<u64, std::shared_ptr<const void>>> pipe_keepalive;
+    /// bbport: occlusion queries (vk_occlusion.h). Before the draw pipe: its thread stops first.
+    std::unique_ptr<OcclusionCounter> occlusion;
+    /// The predicate of the draw or dispatch being recorded (stage B: from its packet).
+    AmdGpu::DrawPredicate draw_predicate{};
+    std::array<u64, 4> streamout_primitives{};
     std::unique_ptr<DrawPipe> draw_pipe;
 
     /// BB_HONEST_LABELS (SignalAfterGpu). Last: its thread stops before the scheduler goes.
